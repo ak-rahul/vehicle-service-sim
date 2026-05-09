@@ -1,10 +1,9 @@
 """
-hybrid_model.py — Optimized Hybrid DES + Mesa ABM Engine
+hybrid_model.py — Optimized Hybrid DES + ABM Engine
 Faithfully implements the granular flowchart architecture.
 """
 
 import simpy
-import random
 import numpy as np
 import logging
 from typing import NamedTuple
@@ -60,13 +59,15 @@ def _patience_monitor(env: simpy.Environment, agent: CustomerAgent,
     except simpy.Interrupt:
         pass  # Process finished or cancelled
 
-def _customer_process(env: simpy.Environment, agent: CustomerAgent, sc: ServiceCenter, logs: list):
+def _customer_process(env: simpy.Environment, agent: CustomerAgent, sc: ServiceCenter, logs: list, rng_service: np.random.RandomState):
     """
     Executes the exact sequence defined in the Flowchart architecture.
     """
     # ── 1. Entering the parking lot ──
     agent.status = "Arrived"
-    if agent.decide_balk(sc.ql_inspection()):
+    # Issue 4: Balking uses visible repair bays queue
+    visible_q = sc.ql_general() + sc.ql_express()
+    if agent.decide_balk(visible_q):
         logs.append(_evt(env, agent, "Balked", "Entry"))
         return
     logs.append(_evt(env, agent, "Arrived", "Parking Lot"))
@@ -86,7 +87,7 @@ def _customer_process(env: simpy.Environment, agent: CustomerAgent, sc: ServiceC
             return
 
         wait_adv = env.now - t_adv_q
-        svc_adv = config.get_advisor_time()
+        svc_adv = config.get_advisor_time(rng_service)
         yield env.timeout(svc_adv)
         logs.append(_evt(env, agent, "AdvisorDone", "Advisor", wait=wait_adv, service=svc_adv))
 
@@ -102,18 +103,17 @@ def _customer_process(env: simpy.Environment, agent: CustomerAgent, sc: ServiceC
             return
 
         wait_insp = env.now - t_insp_q
-        svc_insp = config.get_inspection_time()
+        svc_insp = config.get_inspection_time(rng_service)
         yield env.timeout(svc_insp)
         logs.append(_evt(env, agent, "InspectionDone", "Inspection", wait=wait_insp, service=svc_insp))
 
     # ── 4. Waiting for a free bay ──
-    is_express = random.random() < config.EXPRESS_PROBABILITY
+    is_express = rng_service.random() < config.EXPRESS_PROBABILITY
     bay_type = "Express" if is_express else "General"
     bay_res = sc.express_bays if is_express else sc.general_bays
 
     t_bay_q = env.now
     with bay_res.request(priority=priority) as req:
-        # Is Bay free? (No -> Wait in queue)
         monitor = env.process(_patience_monitor(env, agent, t_bay_q, env.active_process))
         try:
             yield req
@@ -133,47 +133,48 @@ def _customer_process(env: simpy.Environment, agent: CustomerAgent, sc: ServiceC
         # ── 7. Able to carry out work? ──
         repair_svc_time = config.TIME_DRIVE_TO_BAY + config.TIME_CLARIFY_SCOPE
         
-        if random.random() <= config.PROB_ABLE_TO_REPAIR:
-            # Yes: Make an order for vehicle repair -> Get spare parts -> Carry out repair work -> Check completed work
+        if rng_service.random() <= config.PROB_ABLE_TO_REPAIR:
             yield env.timeout(config.TIME_ORDER_REPAIR)
             yield env.timeout(config.TIME_GET_SPARE_PARTS)
-            
-            main_repair_time = config.get_service_time(is_express)
+            main_repair_time = config.get_service_time(rng_service, is_express)
             yield env.timeout(main_repair_time)
-            
             yield env.timeout(config.TIME_CHECK_COMPLETED)
             repair_svc_time += (config.TIME_ORDER_REPAIR + config.TIME_GET_SPARE_PARTS + main_repair_time + config.TIME_CHECK_COMPLETED)
-        
-        logs.append(_evt(env, agent, "RepairDone", bay_type, wait=wait_bay, service=repair_svc_time))
+            logs.append(_evt(env, agent, "RepairDone", bay_type, wait=wait_bay, service=repair_svc_time))
+        else:
+            # Issue 7: Repair fails -> log as RepairFailed but proceed to documentation
+            logs.append(_evt(env, agent, "RepairFailed", bay_type, wait=wait_bay, service=repair_svc_time))
 
-        # ── 8. Execute documentation work & pay ──
-        # Uses Advisor resource again as per standard operations (though simplified here to avoid deadlocks)
-        yield env.timeout(config.TIME_DOCUMENTATION_PAY)
-        
-        # ── 9. OUT/END ──
-        total_time = env.now - t_start
-        logs.append(_evt(env, agent, "Departed", "Exit", wait=0.0, service=config.TIME_DOCUMENTATION_PAY))
-        logs.append(_evt(env, agent, "TotalTime", "All", service=total_time))
+    # ── 8. Execute documentation work & pay ──
+    yield env.timeout(config.TIME_DOCUMENTATION_PAY)
+    
+    # ── 9. OUT/END ──
+    total_time = env.now - t_start
+    logs.append(_evt(env, agent, "Departed", "Exit", wait=0.0, service=config.TIME_DOCUMENTATION_PAY))
+    logs.append(_evt(env, agent, "TotalTime", "All", service=total_time))
 
-def _arrival_generator(env: simpy.Environment, sc: ServiceCenter, abm: ServiceCenterABM, logs: list):
+def _arrival_generator(env: simpy.Environment, sc: ServiceCenter, abm: ServiceCenterABM, logs: list, 
+                       rng_arrival: np.random.RandomState, rng_service: np.random.RandomState, rng_agent: np.random.RandomState):
     """Arrivals via NHPP Thinning (Lewis-Shedler)"""
     while True:
-        u_time = np.random.exponential(1.0 / config.LAMBDA_MAX)
+        u_time = rng_arrival.exponential(1.0 / config.LAMBDA_MAX)
         yield env.timeout(u_time)
         exact_rate = config.get_arrival_rate(env.now)
-        if np.random.random() <= (exact_rate / config.LAMBDA_MAX):
-            agent = abm.create_agent()
-            env.process(_customer_process(env, agent, sc, logs))
+        if rng_arrival.random() <= (exact_rate / config.LAMBDA_MAX):
+            agent = abm.create_agent(rng_agent)
+            env.process(_customer_process(env, agent, sc, logs, rng_service))
 
 def run_hybrid(sim_time: float = config.SIMULATION_TIME, cfg: dict | None = None, seed: int = config.RANDOM_SEED) -> list[dict]:
-    random.seed(seed)
-    np.random.seed(seed)
+    # Issue 2: Independent RNG streams for exact arrival/service matching between models
+    rng_arrival = np.random.RandomState(seed)
+    rng_service = np.random.RandomState(seed + 1)
+    rng_agent = np.random.RandomState(seed + 2)
     
     logs: list[dict] = []
     env = simpy.Environment()
     sc = ServiceCenter(env, cfg)
     abm = ServiceCenterABM()
 
-    env.process(_arrival_generator(env, sc, abm, logs))
+    env.process(_arrival_generator(env, sc, abm, logs, rng_arrival, rng_service, rng_agent))
     env.run(until=sim_time)
     return logs

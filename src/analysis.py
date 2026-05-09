@@ -24,7 +24,24 @@ log = logging.getLogger("analysis")
 #  KPI Extraction (Vectorized)
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
-    if not logs: return {}
+    default_kpis = {
+        "model":             model_name or "—",
+        "total_vehicles":    0,
+        "completed":         0,
+        "balked":            0,
+        "reneged":           0,
+        "throughput_rate":   0.0,
+        "balk_rate":         0.0,
+        "renege_rate":       0.0,
+        "avg_wait_advisor":  0.0,
+        "avg_wait_inspection": 0.0,
+        "avg_wait_bay":      0.0,
+        "avg_total_time":    0.0,
+        "p95_total_time":    0.0,
+        "max_total_time":    0.0,
+        "avg_wait_all_stages": 0.0,
+    }
+    if not logs: return default_kpis
     
     # Pre-allocate DataFrame for vectorized operations
     df = pd.DataFrame.from_records(logs)
@@ -36,8 +53,8 @@ def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
     balk   = ev_counts.get("Balked", 0)
     renege = ev_counts.get("Reneged", 0)
 
-    # Vectorized conditional means
-    done_events = ["AdvisorDone", "InspectionDone", "RepairDone", "Reneged"]
+    # Vectorized conditional means (excluding Reneged to avoid double counting, Issue 8)
+    done_events = ["AdvisorDone", "InspectionDone", "RepairDone", "RepairFailed"]
     done_mask = df["event"].isin(done_events)
     
     adv_wait  = df[(df["stage"] == "Advisor") & done_mask]["wait_min"].mean()
@@ -120,11 +137,18 @@ def run_optimization_sweep(
                         n_reps=n_reps, seed_base=seed_base)
 
     results = []
-    # Utilize maximum CPU cores for parallel execution
+    # Issue 10: Use ProcessPoolExecutor for true CPU parallelism
+    # Wrapped in a try-except to fallback to ThreadPoolExecutor for Windows + Streamlit compatibility
     max_workers = os.cpu_count() or 4
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for res in executor.map(worker_fn, configs):
-            results.append(res)
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for res in executor.map(worker_fn, configs):
+                results.append(res)
+    except Exception as e:
+        log.warning(f"ProcessPoolExecutor failed ({e}), falling back to ThreadPoolExecutor.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for res in executor.map(worker_fn, configs):
+                results.append(res)
 
     df = pd.DataFrame(results)
     df.sort_values("avg_wait_all_stages", inplace=True)

@@ -104,10 +104,12 @@ with st.sidebar:
         express = st.number_input("⚡ Exp Bays", 0, 10, config.NUM_EXPRESS_BAYS)
         
     st.markdown("---")
+    # Issue 11: Provide a reproducible random seed
+    seed = st.number_input("🎲 Random Seed", value=42)
+    
     if st.button("🚀 EXECUTE SIMULATION", use_container_width=True, type="primary"):
         with st.spinner("Processing Hybrid Engines..."):
             cfg = {"num_advisors": advisors, "num_inspection": inspection, "num_general": general, "num_express": express}
-            seed = int(time.time())
             st.session_state.des_logs = run_des(sim_time, cfg, seed)
             st.session_state.hybrid_logs = run_hybrid(sim_time, cfg, seed)
             st.session_state.des_kpis = extract_kpis(st.session_state.des_logs, "DES")
@@ -192,11 +194,11 @@ with tab_deep:
     
     st.markdown("#### 📈 Emotional Decay Analysis")
     df_h = pd.DataFrame(st.session_state.hybrid_logs)
-    if 'emotion' in df_h.columns:
-        # Initial emotion dist
-        cust_data = df_h.drop_duplicates(subset=['vehicle'])[['vehicle', 'personality', 'emotion', 'patience']]
+    if 'emotion' in df_h.columns and not df_h.empty:
+        # Issue 9: Plot the final emotion state, not the initial one
+        cust_data = df_h.drop_duplicates(subset=['vehicle'], keep='last')[['vehicle', 'personality', 'emotion', 'patience']]
         fig = px.histogram(cust_data, x="emotion", color="personality", barmode="overlay", 
-                           title="Distribution of Initial Agent Emotions", template="plotly_dark")
+                           title="Distribution of Final Agent Emotions", template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
 with tab_opt:

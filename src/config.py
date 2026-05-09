@@ -4,7 +4,6 @@ Optimized with rigorous statistical distributions, NHPP, and full Flowchart gran
 """
 
 import math
-import numpy as np
 from typing import Tuple
 
 # ─────────────────────────────────────────────
@@ -24,8 +23,8 @@ NUM_EXPRESS_BAYS      = 1
 # ─────────────────────────────────────────────
 #  Arrival Rates (Vehicles / min) - From Architecture 03
 # ─────────────────────────────────────────────
-# Original lambda = 0.019 veh/min, but we apply NHPP thinning for rush hours.
-LAMBDA_BASE = 0.019
+# Increased LAMBDA_BASE to 0.100 to produce realistic queue dynamics (Issue 6)
+LAMBDA_BASE = 0.100
 LAMBDA_MAX  = LAMBDA_BASE * 3.0 
 
 # ─────────────────────────────────────────────
@@ -57,14 +56,6 @@ PROB_ABLE_TO_REPAIR    = 0.95  # 5% chance the center cannot do the work (no par
 EXPRESS_PROBABILITY    = 0.20
 
 # ─────────────────────────────────────────────
-#  DES-Only Model Parameters
-# ─────────────────────────────────────────────
-DES_MAX_WAIT_ADVISOR    = 45.0
-DES_MAX_WAIT_INSPECTION = 60.0
-DES_MAX_WAIT_BAY        = 120.0
-DES_BALK_THRESHOLD      = 8
-
-# ─────────────────────────────────────────────
 #  Hybrid / ABM Agent Parameters
 #  Implementation of the Liu-Zhen Emotional Contagion/Decay Model
 # ─────────────────────────────────────────────
@@ -94,7 +85,7 @@ OPT_GENERAL_RANGE     = [4, 5, 6, 7]
 OPT_EXPRESS_RANGE     = [1, 2]
 
 # ─────────────────────────────────────────────
-#  Stochastic Sampling Helpers
+#  Stochastic Sampling Helpers (Using explicit RNG stream)
 # ─────────────────────────────────────────────
 def get_arrival_rate(t: float) -> float:
     """Returns exact arrival rate lambda(t) for NHPP."""
@@ -105,8 +96,8 @@ def get_arrival_rate(t: float) -> float:
         return LAMBDA_BASE * 1.5
     return LAMBDA_BASE
 
-def get_advisor_time() -> float: return np.random.lognormal(MU_ADV, SIG_ADV)
-def get_inspection_time() -> float: return np.random.lognormal(MU_INSP, SIG_INSP)
-def get_service_time(is_express: bool = False) -> float:
-    if is_express: return np.random.lognormal(MU_EXP, SIG_EXP)
-    return np.random.lognormal(MU_GEN, SIG_GEN)
+def get_advisor_time(rng) -> float: return rng.lognormal(MU_ADV, SIG_ADV)
+def get_inspection_time(rng) -> float: return rng.lognormal(MU_INSP, SIG_INSP)
+def get_service_time(rng, is_express: bool = False) -> float:
+    if is_express: return rng.lognormal(MU_EXP, SIG_EXP)
+    return rng.lognormal(MU_GEN, SIG_GEN)
