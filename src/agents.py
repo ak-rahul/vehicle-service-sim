@@ -1,80 +1,74 @@
+"""
+agents.py — Optimized Mesa CustomerAgent with continuous emotional decay.
+"""
+
 import numpy as np
-import random
+from mesa import Agent, Model
+
 from src import config
 
-class CustomerAgent:
+class ServiceCenterABM(Model):
+    """Mesa Model managing all CustomerAgents."""
+    def __init__(self):
+        super().__init__()
+        self._next_id = 1
+
+    def create_agent(self) -> "CustomerAgent":
+        agent = CustomerAgent(self._next_id, self)
+        self._next_id += 1
+        return agent
+
+    def step(self):
+        pass
+
+
+class CustomerAgent(Agent):
     """
-    Represents an autonomous customer agent with psychological traits 
-    affecting their behavior in the simulation (Balking and Reneging).
+    Customer Agent utilizing continuous emotional state [0.0 - 1.0].
+    Emotion decays exponentially based on elapsed wait time.
     """
-    def __init__(self, agent_id):
-        self.id = agent_id
-        
-        # Assign personality and emotion based on configured probabilities
+    def __init__(self, unique_id: int, model: ServiceCenterABM):
+        super().__init__(model)
+        self.unique_id = unique_id
+
         self.personality = np.random.choice(
-            ['Conservative', 'Steady', 'Aggressive'], 
-            p=config.PERSONALITY_PROBS
-        )
-        self.emotion = np.random.choice(
-            ['Positive', 'Neutral', 'Negative', 'Unstable'], 
-            p=config.EMOTION_PROBS
+            ["Conservative", "Steady", "Aggressive"],
+            p=config.PERSONALITY_PROBS,
         )
         
-        self.patience_threshold = self._calculate_patience()
+        # Continuous emotion: 1.0 = ecstatic, 0.0 = completely frustrated
+        self.emotion_val = np.clip(np.random.normal(config.EMOTION_INITIAL_MU, config.EMOTION_INITIAL_SIGMA), 0.1, 1.0)
         
-        # Metrics to track
-        self.arrival_time = None
-        self.queue_start_time = None
-        self.service_start_time = None
-        self.departure_time = None
-        self.status = "Created" # Options: Created, Waiting, Servicing, Completed, Reneged, Balked
-
-    def _calculate_patience(self):
-        """
-        Calculates how long the customer is willing to wait in queue
-        before reneging, using their personality base and emotional multiplier.
-        """
-        # Base limits
-        base_min, base_max = config.BASE_PATIENCE_LIMITS[self.personality]
-        base_patience = random.uniform(base_min, base_max)
+        # Base patience drawn from lognormal distribution based on personality
+        mu, sig = config.PATIENCE_PARAMS[self.personality]
+        self.base_patience = np.random.lognormal(mu, sig)
         
-        # Apply emotional modifier
-        multiplier = config.EMOTION_MULTIPLIERS[self.emotion]
-        
-        # If unstable, they might randomly act irrationally short or long
-        if self.emotion == 'Unstable' and random.random() < 0.2:
-            multiplier = 0.2 # Sudden drop in patience
-            
-        final_patience = base_patience * multiplier
-        return final_patience
+        self.balk_threshold = config.BALK_THRESHOLDS[self.personality]
 
-    def decide_balk(self, current_queue_length):
-        """
-        Balking: Decides if they refuse to join the queue upon arrival.
-        Returns True if they leave immediately, False to stay.
-        """
-        # A simple balking threshold based on personality
-        if self.personality == 'Aggressive':
-            threshold = 3
-        elif self.personality == 'Steady':
-            threshold = 6
-        else: # Conservative
-            threshold = 10
-            
-        if self.emotion == 'Negative':
-            threshold = max(1, threshold - 2)
-            
-        return current_queue_length >= threshold
+    @property
+    def patience_threshold(self) -> float:
+        """Effective patience is a function of base patience scaled by current emotion."""
+        return max(2.0, self.base_patience * self.emotion_val)
 
-    def update_emotion(self, wait_time):
-        """
-        Dynamic emotional state mapping. The longer they wait, the worse they feel.
-        """
-        if wait_time > self.patience_threshold * 0.5:
-            if self.emotion in ['Positive', 'Neutral']:
-                self.emotion = 'Negative'
-                # Re-calculate patience with worse emotion
-                self.patience_threshold = self._calculate_patience()
-                
-    def __str__(self):
-        return f"Customer {self.id} ({self.personality}, {self.emotion}) | Patience: {self.patience_threshold:.1f}m"
+    def decide_balk(self, queue_length: int) -> bool:
+        """Balking likelihood increases as initial emotion drops."""
+        threshold = self.balk_threshold
+        if self.emotion_val < 0.5:
+            threshold = max(1, int(threshold * 0.6))
+        return queue_length >= threshold
+
+    def update_emotion_from_wait(self, elapsed_wait: float):
+        """Exponential emotional decay based on wait duration."""
+        # Emotion decays slightly for every minute waited.
+        # Decay rate is faster for Aggressive personalities.
+        decay_rate = 0.005 if self.personality == "Conservative" else (0.01 if self.personality == "Steady" else 0.02)
+        self.emotion_val *= np.exp(-decay_rate * elapsed_wait)
+
+    @property
+    def emotion_label(self) -> str:
+        if self.emotion_val >= 0.7: return "Positive"
+        if self.emotion_val >= 0.4: return "Neutral"
+        return "Negative"
+
+    def step(self):
+        pass
