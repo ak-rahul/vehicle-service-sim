@@ -14,6 +14,7 @@ from src.analysis import (
     extract_kpis,
     run_optimization_sweep,
     plot_kpi_comparison,
+    plot_financials,
     plot_wait_distributions,
     plot_hourly_throughput,
     plot_outcome_donut,
@@ -112,8 +113,8 @@ with st.sidebar:
             cfg = {"num_advisors": advisors, "num_inspection": inspection, "num_general": general, "num_express": express}
             st.session_state.des_logs = run_des(sim_time, cfg, seed)
             st.session_state.hybrid_logs = run_hybrid(sim_time, cfg, seed)
-            st.session_state.des_kpis = extract_kpis(st.session_state.des_logs, "DES")
-            st.session_state.hybrid_kpis = extract_kpis(st.session_state.hybrid_logs, "Hybrid")
+            st.session_state.des_kpis = extract_kpis(st.session_state.des_logs, "DES", cfg=cfg, sim_time=sim_time)
+            st.session_state.hybrid_kpis = extract_kpis(st.session_state.hybrid_logs, "Hybrid", cfg=cfg, sim_time=sim_time)
             st.toast("Simulation complete!", icon="✅")
 
 # ─── Main Content ────────────────────────────────────────────────────────────
@@ -165,13 +166,13 @@ hyb = st.session_state.hybrid_kpis
 # Metric Row
 c1, c2, c3, c4 = st.columns(4)
 c1.markdown(premium_metric("Throughput Rate", des["throughput_rate"], hyb["throughput_rate"], "%", invert=True), unsafe_allow_html=True)
-c2.markdown(premium_metric("Avg Total Wait", des["avg_wait_all_stages"], hyb["avg_wait_all_stages"], "m"), unsafe_allow_html=True)
-c3.markdown(premium_metric("Balk Rate", des["balk_rate"], hyb["balk_rate"], "%"), unsafe_allow_html=True)
-c4.markdown(premium_metric("Renege Rate", des["renege_rate"], hyb["renege_rate"], "%"), unsafe_allow_html=True)
+c2.markdown(premium_metric("Net Profit", des["net_profit"], hyb["net_profit"], "$", invert=True), unsafe_allow_html=True)
+c3.markdown(premium_metric("Lost Revenue", des["lost_revenue"], hyb["lost_revenue"], "$"), unsafe_allow_html=True)
+c4.markdown(premium_metric("Avg Total Wait", des["avg_wait_all_stages"], hyb["avg_wait_all_stages"], "m"), unsafe_allow_html=True)
 
 st.markdown("---")
 
-tab_comp, tab_deep, tab_opt = st.tabs(["📊 Performance Benchmarking", "🧠 Behavioral Analysis", "🎯 Resource Optimization"])
+tab_comp, tab_deep, tab_fin, tab_opt = st.tabs(["📊 Performance Benchmarking", "🧠 Behavioral Analysis", "💵 Financial Analysis", "🎯 Resource Optimization"])
 
 with tab_comp:
     col1, col2 = st.columns([2, 1])
@@ -201,21 +202,33 @@ with tab_deep:
                            title="Distribution of Final Agent Emotions", template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
+with tab_fin:
+    st.markdown("### 💵 Financial Performance")
+    st.write("Evaluating the economic impact of operational bottlenecks, balking, and reneging.")
+    st.plotly_chart(plot_financials(des, hyb), use_container_width=True)
+
 with tab_opt:
     st.markdown("### 🔍 Intelligent Parameter Sweep")
-    st.write("Iteratively testing resource combinations to minimize systemic wait times.")
+    st.write("Iteratively testing resource combinations to maximize profit or minimize wait times.")
     
     with st.form("opt_form"):
         st.markdown("**Range Selection:**")
-        c1, c2, c3, c4 = st.columns(4)
-        a_r = c1.multiselect("Advisors", [1, 2, 3], default=[1, 2])
-        i_r = c2.multiselect("Inspection", [1, 2, 3], default=[1, 2])
-        g_r = c3.multiselect("Gen Bays", [4, 5, 6, 7], default=[5, 6])
-        e_r = c4.multiselect("Exp Bays", [1, 2], default=[1])
+        c1, c2, c3, c4, c5 = st.columns(5)
+        a_r = c1.multiselect("Advisors", [1, 2, 3, 4], default=[1, 2])
+        i_r = c2.multiselect("Inspection", [1, 2, 3, 4], default=[1, 2])
+        g_r = c3.multiselect("Gen Bays", [4, 5, 6, 7, 8], default=[5, 6])
+        e_r = c4.multiselect("Exp Bays", [1, 2, 3], default=[1])
+        opt_target = c5.selectbox("Optimize For", ["Net Profit", "Wait Time"])
         
         if st.form_submit_button("Start Optimization", use_container_width=True):
             with st.spinner("Running parallel simulations..."):
-                st.session_state.optimization_results = run_optimization_sweep(run_hybrid, 600, a_r, i_r, g_r, e_r, n_reps=2)
+                sort_col = "net_profit" if opt_target == "Net Profit" else "avg_wait_all_stages"
+                ascending = False if opt_target == "Net Profit" else True
+                st.session_state.optimization_results = run_optimization_sweep(
+                    run_hybrid, sim_time, a_r, i_r, g_r, e_r, 
+                    n_reps=2, sort_by=sort_col, ascending=ascending
+                )
+                st.session_state.opt_target = opt_target
                 
     if st.session_state.optimization_results is not None:
         best = st.session_state.optimization_results.iloc[0]
@@ -229,7 +242,9 @@ with tab_opt:
             st.info(f"🔧 Gen Bays: **{int(best['num_general'])}**")
             st.info(f"⚡ Exp Bays: **{int(best['num_express'])}**")
             st.markdown(f"**Projected Wait:** {best['avg_wait_all_stages']:.1f}m")
+            st.markdown(f"**Projected Profit:** ${best['net_profit']:,.2f}")
         with col2:
             st.plotly_chart(plot_optimal_config_radar(best, hyb), use_container_width=True)
         
-        st.plotly_chart(plot_optimization_surface(st.session_state.optimization_results), use_container_width=True)
+        target_col = "net_profit" if st.session_state.get("opt_target") == "Net Profit" else "avg_wait_all_stages"
+        st.plotly_chart(plot_optimization_surface(st.session_state.optimization_results, y_col=target_col), use_container_width=True)

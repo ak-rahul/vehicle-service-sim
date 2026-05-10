@@ -56,6 +56,18 @@ PROB_ABLE_TO_REPAIR    = 0.95  # 5% chance the center cannot do the work (no par
 EXPRESS_PROBABILITY    = 0.20
 
 # ─────────────────────────────────────────────
+#  Financial & Business Metrics ($)
+# ─────────────────────────────────────────────
+COST_PER_ADVISOR_HR = 25.0
+COST_PER_INSPECTOR_HR = 30.0
+COST_PER_MECHANIC_HR = 40.0
+
+REVENUE_GENERAL_BASE = 50.0
+REVENUE_GENERAL_PER_HR = 80.0
+REVENUE_EXPRESS = 120.0
+LOST_REVENUE_PENALTY = 100.0  # Avg lost revenue per balk/renege
+
+# ─────────────────────────────────────────────
 #  Hybrid / ABM Agent Parameters
 #  Implementation of the Liu-Zhen Emotional Contagion/Decay Model
 # ─────────────────────────────────────────────
@@ -101,3 +113,7 @@ def get_inspection_time(rng) -> float: return rng.lognormal(MU_INSP, SIG_INSP)
 def get_service_time(rng, is_express: bool = False) -> float:
     if is_express: return rng.lognormal(MU_EXP, SIG_EXP)
     return rng.lognormal(MU_GEN, SIG_GEN)
+
+def get_stage_time(rng, base_time: float) -> float:
+    """Adds a small stochastic variance (10%) to deterministic stages."""
+    return max(0.1, rng.normal(base_time, base_time * 0.1))

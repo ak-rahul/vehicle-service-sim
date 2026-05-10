@@ -65,14 +65,14 @@ def main():
     if args.mode in ['des', 'both']:
         logger.info("Starting Pure DES simulation...")
         des_logs = run_des(sim_time=args.time, cfg=cfg_override, seed=seed)
-        des_kpis = extract_kpis(des_logs, "DES")
+        des_kpis = extract_kpis(des_logs, "DES", cfg=cfg_override, sim_time=args.time)
         print("\n--- DES KPIs ---")
         print(json.dumps(des_kpis, indent=2))
         
     if args.mode in ['hybrid', 'both']:
         logger.info("Starting Hybrid simulation...")
         hybrid_logs = run_hybrid(sim_time=args.time, cfg=cfg_override, seed=seed)
-        hybrid_kpis = extract_kpis(hybrid_logs, "Hybrid")
+        hybrid_kpis = extract_kpis(hybrid_logs, "Hybrid", cfg=cfg_override, sim_time=args.time)
         print("\n--- Hybrid KPIs ---")
         print(json.dumps(hybrid_kpis, indent=2))
         

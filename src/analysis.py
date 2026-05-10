@@ -18,12 +18,14 @@ import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
 
+from src import config
+
 log = logging.getLogger("analysis")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  KPI Extraction (Vectorized)
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
+def extract_kpis(logs: list[dict], model_name: str = "", cfg: dict = None, sim_time: float = config.SIMULATION_TIME) -> dict:
     default_kpis = {
         "model":             model_name or "—",
         "total_vehicles":    0,
@@ -40,6 +42,10 @@ def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
         "p95_total_time":    0.0,
         "max_total_time":    0.0,
         "avg_wait_all_stages": 0.0,
+        "revenue":           0.0,
+        "staff_cost":        0.0,
+        "lost_revenue":      0.0,
+        "net_profit":        0.0,
     }
     if not logs: return default_kpis
     
@@ -71,7 +77,7 @@ def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
     p95_total   = total_times.quantile(0.95) if not total_times.empty else 0.0
     max_total   = total_times.max() if not total_times.empty else 0.0
 
-    return {
+    result = {
         "model":             model_name or (df["model"].iloc[0] if "model" in df.columns else "—"),
         "total_vehicles":    int(total),
         "completed":         int(comp),
@@ -88,6 +94,32 @@ def extract_kpis(logs: list[dict], model_name: str = "") -> dict:
         "max_total_time":    float(np.round(max_total, 2)),
         "avg_wait_all_stages": float(np.round(adv_wait + insp_wait + bay_wait, 2)),
     }
+    
+    # Financial Calculations
+    cfg_safe = cfg or {}
+    n_adv = cfg_safe.get("num_advisors", config.NUM_SERVICE_ADVISORS)
+    n_insp = cfg_safe.get("num_inspection", config.NUM_INSPECTION_BAYS)
+    n_gen = cfg_safe.get("num_general", config.NUM_GENERAL_BAYS)
+    n_exp = cfg_safe.get("num_express", config.NUM_EXPRESS_BAYS)
+    
+    staff_cost = (sim_time / 60.0) * (n_adv * config.COST_PER_ADVISOR_HR + n_insp * config.COST_PER_INSPECTOR_HR + (n_gen + n_exp) * config.COST_PER_MECHANIC_HR)
+    
+    df_repair_gen = df[(df["event"] == "RepairDone") & (df["stage"] == "General")]
+    df_repair_exp = df[(df["event"] == "RepairDone") & (df["stage"] == "Express")]
+    
+    rev_gen = len(df_repair_gen) * config.REVENUE_GENERAL_BASE + (df_repair_gen["service_min"].sum() / 60.0) * config.REVENUE_GENERAL_PER_HR
+    rev_exp = len(df_repair_exp) * config.REVENUE_EXPRESS
+    
+    total_rev = rev_gen + rev_exp
+    lost_rev = (balk + renege) * config.LOST_REVENUE_PENALTY
+    net_profit = total_rev - staff_cost
+    
+    result["revenue"] = float(np.round(total_rev, 2))
+    result["staff_cost"] = float(np.round(staff_cost, 2))
+    result["lost_revenue"] = float(np.round(lost_rev, 2))
+    result["net_profit"] = float(np.round(net_profit, 2))
+    
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Parallel Optimization Sweep
@@ -105,7 +137,7 @@ def _run_single_config(cfg_tuple, model_fn, sim_time, n_reps, seed_base):
     rep_kpis = []
     for r in range(n_reps):
         logs = model_fn(sim_time=sim_time, cfg=cfg, seed=seed_base + r)
-        rep_kpis.append(extract_kpis(logs))
+        rep_kpis.append(extract_kpis(logs, cfg=cfg, sim_time=sim_time))
         
     avg = {}
     for key in rep_kpis[0]:
@@ -126,6 +158,7 @@ def run_optimization_sweep(
     advisor_range: list[int], inspection_range: list[int],
     general_range: list[int], express_range: list[int],
     n_reps: int = 3, seed_base: int = 42,
+    sort_by: str = "avg_wait_all_stages", ascending: bool = True
 ) -> pd.DataFrame:
     """Multi-processed parameter grid search."""
     # Generate Cartesian product of all configs
@@ -151,7 +184,8 @@ def run_optimization_sweep(
                 results.append(res)
 
     df = pd.DataFrame(results)
-    df.sort_values("avg_wait_all_stages", inplace=True)
+    df.sort_values(sort_by, ascending=ascending, inplace=True)
+    df.reset_index(drop=True, inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
@@ -178,6 +212,17 @@ def plot_kpi_comparison(des_kpis: dict, hybrid_kpis: dict) -> go.Figure:
     fig.add_trace(go.Bar(name="DES (Pure)", x=labels, y=des_vals, marker_color=PALETTE["DES"], text=[f"{v:.1f}" for v in des_vals], textposition="outside"))
     fig.add_trace(go.Bar(name="Hybrid (DES + ABM)", x=labels, y=hybrid_vals, marker_color=PALETTE["Hybrid"], text=[f"{v:.1f}" for v in hybrid_vals], textposition="outside"))
     fig.update_layout(barmode="group", title="📊 DES vs Hybrid Model KPIs", template="plotly_dark", height=480)
+    return fig
+
+def plot_financials(des_kpis: dict, hybrid_kpis: dict) -> go.Figure:
+    fig = go.Figure()
+    categories = ["Revenue", "Staff Cost", "Lost Revenue", "Net Profit"]
+    des_vals = [des_kpis.get("revenue", 0), des_kpis.get("staff_cost", 0), des_kpis.get("lost_revenue", 0), des_kpis.get("net_profit", 0)]
+    hybrid_vals = [hybrid_kpis.get("revenue", 0), hybrid_kpis.get("staff_cost", 0), hybrid_kpis.get("lost_revenue", 0), hybrid_kpis.get("net_profit", 0)]
+    
+    fig.add_trace(go.Bar(name="DES (Pure)", x=categories, y=des_vals, marker_color=PALETTE["DES"], text=[f"${v:,.0f}" for v in des_vals], textposition="auto"))
+    fig.add_trace(go.Bar(name="Hybrid (DES + ABM)", x=categories, y=hybrid_vals, marker_color=PALETTE["Hybrid"], text=[f"${v:,.0f}" for v in hybrid_vals], textposition="auto"))
+    fig.update_layout(barmode="group", title="💵 Financial Projections & Profitability", template="plotly_dark", height=480)
     return fig
 
 def plot_wait_distributions(des_logs: list[dict], hybrid_logs: list[dict]) -> go.Figure:
@@ -227,12 +272,14 @@ def plot_personality_breakdown(hybrid_logs: list[dict]) -> go.Figure:
     fig.update_layout(height=420)
     return fig
 
-def plot_optimization_surface(opt_df: pd.DataFrame, x_col: str = "num_general") -> go.Figure:
+def plot_optimization_surface(opt_df: pd.DataFrame, x_col: str = "num_general", y_col: str = "avg_wait_all_stages") -> go.Figure:
     fig = go.Figure()
     for i, val in enumerate(sorted(opt_df["num_advisors"].unique())):
         sub = opt_df[opt_df["num_advisors"] == val].sort_values(x_col)
-        fig.add_trace(go.Scatter(x=sub[x_col], y=sub["avg_wait_all_stages"], mode="lines+markers", name=f"Advisors = {val}"))
-    fig.update_layout(title=f"🔍 Wait Time vs {x_col.replace('_', ' ').title()}", template="plotly_dark", height=460)
+        fig.add_trace(go.Scatter(x=sub[x_col], y=sub[y_col], mode="lines+markers", name=f"Advisors = {val}"))
+    
+    y_title = "Wait Time (min)" if y_col == "avg_wait_all_stages" else "Net Profit ($)"
+    fig.update_layout(title=f"🔍 {y_title} vs {x_col.replace('_', ' ').title()}", template="plotly_dark", height=460)
     return fig
 
 def plot_optimal_config_radar(optimal_row: pd.Series, baseline_kpis: dict) -> go.Figure:

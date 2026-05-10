@@ -14,21 +14,12 @@ from src import config
 
 log = logging.getLogger("des_model")
 
-class LogEvent(NamedTuple):
-    model: str
-    time: float
-    vehicle: int
-    event: str
-    stage: str
-    wait_min: float
-    service_min: float
-
 def _evt(env, vid: int, event: str, stage: str = "—", wait: float = 0.0, service: float = 0.0) -> dict:
-    return LogEvent(
-        model="DES", time=round(env.now, 2), vehicle=vid,
-        event=event, stage=stage,
-        wait_min=round(wait, 2), service_min=round(service, 2)
-    )._asdict()
+    return {
+        "model": "DES", "time": round(env.now, 2), "vehicle": vid,
+        "event": event, "stage": stage,
+        "wait_min": round(wait, 2), "service_min": round(service, 2)
+    }
 
 def _vehicle_process(env: simpy.Environment, vid: int, sc: ServiceCenter, logs: list, 
                      rng_service: np.random.RandomState, rng_agent: np.random.RandomState):
@@ -93,31 +84,37 @@ def _vehicle_process(env: simpy.Environment, vid: int, sc: ServiceCenter, logs: 
         wait_bay = env.now - t_bay_q
         
         # ── 5. Drive the vehicle to bay ──
-        yield env.timeout(config.TIME_DRIVE_TO_BAY)
+        drive_time = config.get_stage_time(rng_service, config.TIME_DRIVE_TO_BAY)
+        yield env.timeout(drive_time)
         
         # ── 6. Clarify the scope of work ──
-        yield env.timeout(config.TIME_CLARIFY_SCOPE)
+        clarify_time = config.get_stage_time(rng_service, config.TIME_CLARIFY_SCOPE)
+        yield env.timeout(clarify_time)
         
         # ── 7. Able to carry out work? ──
-        repair_svc_time = config.TIME_DRIVE_TO_BAY + config.TIME_CLARIFY_SCOPE
+        repair_svc_time = drive_time + clarify_time
         
         if rng_service.random() <= config.PROB_ABLE_TO_REPAIR:
-            yield env.timeout(config.TIME_ORDER_REPAIR)
-            yield env.timeout(config.TIME_GET_SPARE_PARTS)
+            order_time = config.get_stage_time(rng_service, config.TIME_ORDER_REPAIR)
+            yield env.timeout(order_time)
+            parts_time = config.get_stage_time(rng_service, config.TIME_GET_SPARE_PARTS)
+            yield env.timeout(parts_time)
             main_repair_time = config.get_service_time(rng_service, is_express)
             yield env.timeout(main_repair_time)
-            yield env.timeout(config.TIME_CHECK_COMPLETED)
-            repair_svc_time += (config.TIME_ORDER_REPAIR + config.TIME_GET_SPARE_PARTS + main_repair_time + config.TIME_CHECK_COMPLETED)
+            check_time = config.get_stage_time(rng_service, config.TIME_CHECK_COMPLETED)
+            yield env.timeout(check_time)
+            repair_svc_time += (order_time + parts_time + main_repair_time + check_time)
             logs.append(_evt(env, vid, "RepairDone", bay_type, wait=wait_bay, service=repair_svc_time))
         else:
             logs.append(_evt(env, vid, "RepairFailed", bay_type, wait=wait_bay, service=repair_svc_time))
 
     # ── 8. Execute documentation work & pay ──
-    yield env.timeout(config.TIME_DOCUMENTATION_PAY)
+    doc_time = config.get_stage_time(rng_service, config.TIME_DOCUMENTATION_PAY)
+    yield env.timeout(doc_time)
     
     # ── 9. OUT/END ──
     total_time = env.now - t_start
-    logs.append(_evt(env, vid, "Departed", "Exit", wait=0.0, service=config.TIME_DOCUMENTATION_PAY))
+    logs.append(_evt(env, vid, "Departed", "Exit", wait=0.0, service=doc_time))
     logs.append(_evt(env, vid, "TotalTime", "All", service=total_time))
 
 def _arrival_generator(env: simpy.Environment, sc: ServiceCenter, logs: list,
