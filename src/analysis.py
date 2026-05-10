@@ -1,108 +1,316 @@
+"""
+analysis.py — High-Performance Analysis Engine
+Features multi-processing parameter sweeps and vectorized KPI extraction.
+"""
+
+from __future__ import annotations
+import os
+import logging
+import numpy as np
 import pandas as pd
+import concurrent.futures
+from functools import partial
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
+import plotly.graph_objects as go
+import plotly.express as px
 
-def process_logs(logs, output_dir="outputs"):
-    """
-    Process raw simulation event dictionaries into a Pandas DataFrame,
-    prints base metrics, and generates visualizations.
-    """
-    if not logs:
-        print("No simulation logs to process.")
-        return
-        
-    df = pd.DataFrame(logs)
+from src import config
+
+log = logging.getLogger("analysis")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  KPI Extraction (Vectorized)
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_kpis(logs: list[dict], model_name: str = "", cfg: dict = None, sim_time: float = config.SIMULATION_TIME) -> dict:
+    default_kpis = {
+        "model":             model_name or "—",
+        "total_vehicles":    0,
+        "completed":         0,
+        "balked":            0,
+        "reneged":           0,
+        "throughput_rate":   0.0,
+        "balk_rate":         0.0,
+        "renege_rate":       0.0,
+        "avg_wait_advisor":  0.0,
+        "avg_wait_inspection": 0.0,
+        "avg_wait_bay":      0.0,
+        "avg_total_time":    0.0,
+        "p95_total_time":    0.0,
+        "max_total_time":    0.0,
+        "avg_wait_all_stages": 0.0,
+        "revenue":           0.0,
+        "staff_cost":        0.0,
+        "lost_revenue":      0.0,
+        "net_profit":        0.0,
+    }
+    if not logs: return default_kpis
     
-    # Save raw data
+    # Pre-allocate DataFrame for vectorized operations
+    df = pd.DataFrame.from_records(logs)
+    
+    total  = df["vehicle"].nunique()
+    ev_counts = df["event"].value_counts()
+    
+    comp   = ev_counts.get("Departed", 0)
+    balk   = ev_counts.get("Balked", 0)
+    renege = ev_counts.get("Reneged", 0)
+
+    # Vectorized conditional means (excluding Reneged to avoid double counting, Issue 8)
+    done_events = ["AdvisorDone", "InspectionDone", "RepairDone", "RepairFailed"]
+    done_mask = df["event"].isin(done_events)
+    
+    adv_wait  = df[(df["stage"] == "Advisor") & done_mask]["wait_min"].mean()
+    insp_wait = df[(df["stage"] == "Inspection") & done_mask]["wait_min"].mean()
+    bay_wait  = df[(df["stage"].isin(["General", "Express"])) & done_mask]["wait_min"].mean()
+    
+    # Fill NA with 0.0 for stages that might not have happened
+    adv_wait = 0.0 if pd.isna(adv_wait) else adv_wait
+    insp_wait = 0.0 if pd.isna(insp_wait) else insp_wait
+    bay_wait = 0.0 if pd.isna(bay_wait) else bay_wait
+    
+    total_times = df[df["event"] == "TotalTime"]["service_min"]
+    avg_total   = total_times.mean() if not total_times.empty else 0.0
+    p95_total   = total_times.quantile(0.95) if not total_times.empty else 0.0
+    max_total   = total_times.max() if not total_times.empty else 0.0
+
+    result = {
+        "model":             model_name or (df["model"].iloc[0] if "model" in df.columns else "—"),
+        "total_vehicles":    int(total),
+        "completed":         int(comp),
+        "balked":            int(balk),
+        "reneged":           int(renege),
+        "throughput_rate":   float(np.round(comp / max(1, total) * 100, 1)),
+        "balk_rate":         float(np.round(balk / max(1, total) * 100, 1)),
+        "renege_rate":       float(np.round(renege / max(1, total) * 100, 1)),
+        "avg_wait_advisor":  float(np.round(adv_wait, 2)),
+        "avg_wait_inspection": float(np.round(insp_wait, 2)),
+        "avg_wait_bay":      float(np.round(bay_wait, 2)),
+        "avg_total_time":    float(np.round(avg_total, 2)),
+        "p95_total_time":    float(np.round(p95_total, 2)),
+        "max_total_time":    float(np.round(max_total, 2)),
+        "avg_wait_all_stages": float(np.round(adv_wait + insp_wait + bay_wait, 2)),
+    }
+    
+    # Financial Calculations
+    cfg_safe = cfg or {}
+    n_adv = cfg_safe.get("num_advisors", config.NUM_SERVICE_ADVISORS)
+    n_insp = cfg_safe.get("num_inspection", config.NUM_INSPECTION_BAYS)
+    n_gen = cfg_safe.get("num_general", config.NUM_GENERAL_BAYS)
+    n_exp = cfg_safe.get("num_express", config.NUM_EXPRESS_BAYS)
+    
+    staff_cost = (sim_time / 60.0) * (n_adv * config.COST_PER_ADVISOR_HR + n_insp * config.COST_PER_INSPECTOR_HR + (n_gen + n_exp) * config.COST_PER_MECHANIC_HR)
+    
+    df_repair_gen = df[(df["event"] == "RepairDone") & (df["stage"] == "General")]
+    df_repair_exp = df[(df["event"] == "RepairDone") & (df["stage"] == "Express")]
+    
+    rev_gen = len(df_repair_gen) * config.REVENUE_GENERAL_BASE + (df_repair_gen["service_min"].sum() / 60.0) * config.REVENUE_GENERAL_PER_HR
+    rev_exp = len(df_repair_exp) * config.REVENUE_EXPRESS
+    
+    total_rev = rev_gen + rev_exp
+    lost_rev = (balk + renege) * config.LOST_REVENUE_PENALTY
+    net_profit = total_rev - staff_cost
+    
+    result["revenue"] = float(np.round(total_rev, 2))
+    result["staff_cost"] = float(np.round(staff_cost, 2))
+    result["lost_revenue"] = float(np.round(lost_rev, 2))
+    result["net_profit"] = float(np.round(net_profit, 2))
+    
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Parallel Optimization Sweep
+# ─────────────────────────────────────────────────────────────────────────────
+def _run_single_config(cfg_tuple, model_fn, sim_time, n_reps, seed_base):
+    """Worker function for process pool executor."""
+    adv, insp, gen, exp = cfg_tuple
+    cfg = {
+        "num_advisors": adv,
+        "num_inspection": insp,
+        "num_general": gen,
+        "num_express": exp,
+    }
+    
+    rep_kpis = []
+    for r in range(n_reps):
+        logs = model_fn(sim_time=sim_time, cfg=cfg, seed=seed_base + r)
+        rep_kpis.append(extract_kpis(logs, cfg=cfg, sim_time=sim_time))
+        
+    avg = {}
+    for key in rep_kpis[0]:
+        if isinstance(rep_kpis[0][key], (int, float)):
+            avg[key] = round(float(np.mean([k[key] for k in rep_kpis])), 2)
+        else:
+            avg[key] = rep_kpis[0][key]
+
+    avg.update({
+        "num_advisors": adv, "num_inspection": insp,
+        "num_general": gen, "num_express": exp,
+        "total_staff": adv + insp + gen + exp,
+    })
+    return avg
+
+def run_optimization_sweep(
+    model_fn, sim_time: float,
+    advisor_range: list[int], inspection_range: list[int],
+    general_range: list[int], express_range: list[int],
+    n_reps: int = 3, seed_base: int = 42,
+    sort_by: str = "avg_wait_all_stages", ascending: bool = True
+) -> pd.DataFrame:
+    """Multi-processed parameter grid search."""
+    # Generate Cartesian product of all configs
+    configs = [(a, i, g, e) 
+               for a in advisor_range for i in inspection_range
+               for g in general_range for e in express_range]
+
+    worker_fn = partial(_run_single_config, model_fn=model_fn, sim_time=sim_time, 
+                        n_reps=n_reps, seed_base=seed_base)
+
+    results = []
+    # Issue 10: Use ProcessPoolExecutor for true CPU parallelism
+    # Wrapped in a try-except to fallback to ThreadPoolExecutor for Windows + Streamlit compatibility
+    max_workers = os.cpu_count() or 4
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for res in executor.map(worker_fn, configs):
+                results.append(res)
+    except Exception as e:
+        log.warning(f"ProcessPoolExecutor failed ({e}), falling back to ThreadPoolExecutor.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for res in executor.map(worker_fn, configs):
+                results.append(res)
+
+    df = pd.DataFrame(results)
+    df.sort_values(sort_by, ascending=ascending, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Plotly interactive charts (Unchanged Interface)
+# ─────────────────────────────────────────────────────────────────────────────
+PALETTE = {"DES": "#4F9CF9", "Hybrid": "#F97B4F"}
+
+def plot_kpi_comparison(des_kpis: dict, hybrid_kpis: dict) -> go.Figure:
+    metrics = [
+        ("avg_wait_advisor",    "Avg Advisor Wait (min)"),
+        ("avg_wait_inspection", "Avg Inspection Wait (min)"),
+        ("avg_wait_bay",        "Avg Bay Wait (min)"),
+        ("avg_total_time",      "Avg Total Time (min)"),
+        ("throughput_rate",     "Throughput Rate (%)"),
+        ("balk_rate",           "Balk Rate (%)"),
+        ("renege_rate",         "Renege Rate (%)"),
+    ]
+    labels = [m[1] for m in metrics]
+    des_vals    = [des_kpis.get(m[0], 0) for m in metrics]
+    hybrid_vals = [hybrid_kpis.get(m[0], 0) for m in metrics]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="DES (Pure)", x=labels, y=des_vals, marker_color=PALETTE["DES"], text=[f"{v:.1f}" for v in des_vals], textposition="outside"))
+    fig.add_trace(go.Bar(name="Hybrid (DES + ABM)", x=labels, y=hybrid_vals, marker_color=PALETTE["Hybrid"], text=[f"{v:.1f}" for v in hybrid_vals], textposition="outside"))
+    fig.update_layout(barmode="group", title="📊 DES vs Hybrid Model KPIs", template="plotly_dark", height=480)
+    return fig
+
+def plot_financials(des_kpis: dict, hybrid_kpis: dict) -> go.Figure:
+    fig = go.Figure()
+    categories = ["Revenue", "Staff Cost", "Lost Revenue", "Net Profit"]
+    des_vals = [des_kpis.get("revenue", 0), des_kpis.get("staff_cost", 0), des_kpis.get("lost_revenue", 0), des_kpis.get("net_profit", 0)]
+    hybrid_vals = [hybrid_kpis.get("revenue", 0), hybrid_kpis.get("staff_cost", 0), hybrid_kpis.get("lost_revenue", 0), hybrid_kpis.get("net_profit", 0)]
+    
+    fig.add_trace(go.Bar(name="DES (Pure)", x=categories, y=des_vals, marker_color=PALETTE["DES"], text=[f"${v:,.0f}" for v in des_vals], textposition="auto"))
+    fig.add_trace(go.Bar(name="Hybrid (DES + ABM)", x=categories, y=hybrid_vals, marker_color=PALETTE["Hybrid"], text=[f"${v:,.0f}" for v in hybrid_vals], textposition="auto"))
+    fig.update_layout(barmode="group", title="💵 Financial Projections & Profitability", template="plotly_dark", height=480)
+    return fig
+
+def plot_wait_distributions(des_logs: list[dict], hybrid_logs: list[dict]) -> go.Figure:
+    fig = go.Figure()
+    for stage_key in ["Advisor", "Inspection", "General", "Express"]:
+        df_d = pd.DataFrame(des_logs)
+        df_h = pd.DataFrame(hybrid_logs)
+        
+        if not df_d.empty:
+            wd = df_d[(df_d["stage"] == stage_key) & df_d["event"].isin(["AdvisorDone", "InspectionDone", "Departed", "Reneged"])]["wait_min"].dropna().tolist()
+            if wd: fig.add_trace(go.Box(y=wd, name=f"DES - {stage_key}", marker_color=PALETTE["DES"], boxmean="sd"))
+        if not df_h.empty:
+            wh = df_h[(df_h["stage"] == stage_key) & df_h["event"].isin(["AdvisorDone", "InspectionDone", "Departed", "Reneged"])]["wait_min"].dropna().tolist()
+            if wh: fig.add_trace(go.Box(y=wh, name=f"Hybrid - {stage_key}", marker_color=PALETTE["Hybrid"], boxmean="sd"))
+
+    fig.update_layout(title="⏱ Wait Time Distributions by Stage", template="plotly_dark", height=500)
+    return fig
+
+def plot_hourly_throughput(des_logs: list[dict], hybrid_logs: list[dict]) -> go.Figure:
+    def _hourly(logs, label):
+        df = pd.DataFrame(logs)
+        if df.empty: return pd.DataFrame(columns=["hour", "count", "model"])
+        dep = df[df["event"] == "Departed"].copy()
+        if dep.empty: return pd.DataFrame(columns=["hour", "count", "model"])
+        dep["hour"] = (dep["time"] / 60).astype(int)
+        h = dep.groupby("hour").size().reset_index(name="count")
+        h["model"] = label
+        return h
+
+    combined = pd.concat([_hourly(des_logs, "DES"), _hourly(hybrid_logs, "Hybrid")], ignore_index=True)
+    fig = px.line(combined, x="hour", y="count", color="model", color_discrete_map=PALETTE, markers=True, title="🕐 Hourly Vehicle Throughput", template="plotly_dark")
+    fig.update_layout(height=420)
+    return fig
+
+def plot_outcome_donut(kpis: dict, model_label: str) -> go.Figure:
+    fig = go.Figure(go.Pie(labels=["Completed", "Balked", "Reneged"], values=[kpis.get("completed",0), kpis.get("balked",0), kpis.get("reneged",0)], hole=0.55, marker=dict(colors=["#34D399", "#FBBF24", "#F87171"])))
+    fig.update_layout(title=f"🍩 Customer Outcomes — {model_label}", template="plotly_dark", height=380)
+    return fig
+
+def plot_personality_breakdown(hybrid_logs: list[dict]) -> go.Figure:
+    df = pd.DataFrame(hybrid_logs)
+    if df.empty or "personality" not in df.columns: return go.Figure()
+    final = df[df["event"].isin(["Departed", "Balked", "Reneged"])].drop_duplicates("vehicle", keep="first")
+    if final.empty: return go.Figure()
+    grp = final.groupby(["personality", "event"]).size().reset_index(name="count")
+    fig = px.bar(grp, x="personality", y="count", color="event", color_discrete_map={"Departed": "#34D399", "Balked": "#FBBF24", "Reneged": "#F87171"}, barmode="stack", title="👤 Outcomes by Personality Type", template="plotly_dark")
+    fig.update_layout(height=420)
+    return fig
+
+def plot_optimization_surface(opt_df: pd.DataFrame, x_col: str = "num_general", y_col: str = "avg_wait_all_stages") -> go.Figure:
+    fig = go.Figure()
+    for i, val in enumerate(sorted(opt_df["num_advisors"].unique())):
+        sub = opt_df[opt_df["num_advisors"] == val].sort_values(x_col)
+        fig.add_trace(go.Scatter(x=sub[x_col], y=sub[y_col], mode="lines+markers", name=f"Advisors = {val}"))
+    
+    y_title = "Wait Time (min)" if y_col == "avg_wait_all_stages" else "Net Profit ($)"
+    fig.update_layout(title=f"🔍 {y_title} vs {x_col.replace('_', ' ').title()}", template="plotly_dark", height=460)
+    return fig
+
+def plot_optimal_config_radar(optimal_row: pd.Series, baseline_kpis: dict) -> go.Figure:
+    cats = ["Throughput %", "Balk Rate %↓", "Renege Rate %↓", "Avg Wait (norm)↓", "P95 Time (norm)↓"]
+    mw = max(baseline_kpis.get("avg_total_time", 1), 1)
+    mp95 = max(baseline_kpis.get("p95_total_time", 1), 1)
+    def _norm(v, m): return round(min(1.0, v / max(1.0, m)) * 100, 1)
+    
+    bv = [baseline_kpis.get("throughput_rate",0), 100-baseline_kpis.get("balk_rate",0), 100-baseline_kpis.get("renege_rate",0), 100-_norm(baseline_kpis.get("avg_total_time",0), mw), 100-_norm(baseline_kpis.get("p95_total_time",0), mp95)]
+    ov = [optimal_row.get("throughput_rate",0), 100-optimal_row.get("balk_rate",0), 100-optimal_row.get("renege_rate",0), 100-_norm(optimal_row.get("avg_total_time",0), mw), 100-_norm(optimal_row.get("p95_total_time",0), mp95)]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=bv+[bv[0]], theta=cats+[cats[0]], fill="toself", name="Baseline", line_color="#4F9CF9"))
+    fig.add_trace(go.Scatterpolar(r=ov+[ov[0]], theta=cats+[cats[0]], fill="toself", name="Optimal", line_color="#34D399"))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), title="🎯 Optimal vs Baseline", template="plotly_dark", height=500)
+    return fig
+
+def export_static_charts(des_kpis: dict, hybrid_kpis: dict, des_logs: list, hybrid_logs: list, output_dir: str = "outputs"):
     os.makedirs(output_dir, exist_ok=True)
-    out_file = os.path.join(output_dir, "sim_logs.csv")
-    df.to_csv(out_file, index=False)
+    sns.set_theme(style="darkgrid", palette="muted")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metrics = ["avg_wait_advisor", "avg_wait_inspection", "avg_wait_bay", "avg_total_time"]
+    x = np.arange(len(metrics)); w = 0.35
+    ax.bar(x - w/2, [des_kpis.get(m, 0) for m in metrics], w, label="DES", color="#4F9CF9")
+    ax.bar(x + w/2, [hybrid_kpis.get(m, 0) for m in metrics], w, label="Hybrid", color="#F97B4F")
+    ax.set_xticks(x); ax.set_xticklabels(["Advisor Wait", "Inspection Wait", "Bay Wait", "Total Time"])
+    ax.legend(); plt.tight_layout(); plt.savefig(os.path.join(output_dir, "kpi_comparison.png"), dpi=200); plt.close()
     
-    # --- Metrics Processing ---
-    total_customers = df['customer'].nunique()
-    completed = df[df['event'].str.contains("Departed")].shape[0]
-    balked = df[df['event'].str.contains("Balked")].shape[0]
-    reneged = df[df['event'].str.contains("Reneged")].shape[0]
-    
-    print("\n" + "="*40)
-    print("=== FINAL SIMULATION PERFORMANCE REPORT ===")
-    print("="*40)
-    print(f"Total Unique Customers Evaluated: {total_customers}")
-    print(f"✅ Successfully Serviced: {completed} ({(completed/total_customers)*100:.1f}%)")
-    print(f"❌ Customers Lost (Immediate Balking): {balked} ({(balked/total_customers)*100:.1f}%)")
-    print(f"❌ Customers Lost (Reneging/Patience): {reneged} ({(reneged/total_customers)*100:.1f}%)")
-    print("="*40)
-    print(f"\nRaw event logs saved to: {out_file}")
-    
-    # --- Visualizations ---
-    print("\nGenerating visual analysis reports in the 'outputs' folder...")
-    _generate_visualizations(df, output_dir)
-    print("Done! Check the 'outputs/' directory for generated charts.")
-
-def _generate_visualizations(df, output_dir):
-    """Generates charts for system evaluation using Seaborn and Matplotlib."""
-    # 1. Status Distribution Pie Chart
-    plt.figure(figsize=(8, 8))
-    
-    completed = df[df['event'].str.contains("Departed")].shape[0]
-    balked = df[df['event'].str.contains("Balked")].shape[0]
-    reneged = df[df['event'].str.contains("Reneged")].shape[0]
-    
-    cases = [completed, balked, reneged]
-    labels = ['Serviced', 'Balked (Queues too long)', 'Reneged (Lost Patience)']
-    colors = ['#4CAF50', '#FF9800', '#F44336'] # Green, Orange, Red
-    
-    # Only keep non-zero slices
-    cases_clean = [c for c in cases if c > 0]
-    labels_clean = [l for i, l in enumerate(labels) if cases[i] > 0]
-    colors_clean = [c for i, c in enumerate(colors) if cases[i] > 0]
-    
-    if cases_clean:
-        plt.pie(cases_clean, labels=labels_clean, autopct='%1.1f%%', startangle=140, colors=colors_clean)
-        plt.title('Final Customer Outcomes Breakdown')
-        plt.savefig(os.path.join(output_dir, 'customer_outcomes.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 2. Events over Time (Queue Load Visualization)
-    plt.figure(figsize=(12, 6))
-    # Count general queue arrivals
-    q_joins = df[df['event'].str.contains("Joined")].copy()
-    if not q_joins.empty:
-        q_joins['hour'] = (q_joins['time'] / 60).astype(int)
-        hourly_traffic = q_joins.groupby(['hour', 'queue']).size().reset_index(name='count')
-        
-        sns.barplot(data=hourly_traffic, x='hour', y='count', hue='queue', palette='viridis')
-        plt.title('Vehicle Traffic Volume per Hour by Queue Type')
-        plt.xlabel('Simulation Time (Hour)')
-        plt.ylabel('Number of Vehicles Entering Queue')
-        plt.legend(title='Queue Type')
-        plt.savefig(os.path.join(output_dir, 'queue_traffic_hourly.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 3. Wait Times (Derived from Arrival and Service Start pairs)
-    # We trace each customer's lifecycle to calculate actual wait times
-    service_starts = df[df['event'].str.contains("Started")]
-    arrivals = df[df['event'].str.contains("Joined")]
-    
-    wait_times = []
-    for c in df['customer'].unique():
-        c_events = df[df['customer'] == c]
-        # Simplistic calculation: Arrival at queue vs started service
-        for q_type in ['Inspection', 'General', 'Express']:
-             q_join = c_events[(c_events['event'] == 'Arrival / Joined Queue') | (c_events['event'].str.contains(f"Joined {q_type}"))]
-             q_start = c_events[c_events['event'].str.contains(f"Started {q_type}")]
-             if not q_join.empty and not q_start.empty:
-                 wait_t = q_start.iloc[0]['time'] - q_join.iloc[0]['time']
-                 wait_times.append({'customer': c, 'queue': q_type, 'wait_time_minutes': wait_t})
-                 
-    if wait_times:
-        wait_df = pd.DataFrame(wait_times)
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(data=wait_df, x='queue', y='wait_time_minutes', palette='pastel')
-        plt.title('Distribution of Customer Wait Times per Queue')
-        plt.ylabel('Wait Time (Minutes)')
-        plt.xlabel('Queue / Service Bay Type')
-        plt.savefig(os.path.join(output_dir, 'wait_times_distribution.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, k, t in zip(axes, [des_kpis, hybrid_kpis], ["DES Model", "Hybrid Model"]):
+        v = [k.get("completed",0), k.get("balked",0), k.get("reneged",0)]
+        if sum(v) > 0: ax.pie([x for x in v if x>0], labels=[l for l,x in zip(["Completed","Balked","Reneged"],v) if x>0], autopct="%1.1f%%", colors=[c for c,x in zip(["#34D399","#FBBF24","#F87171"],v) if x>0])
+        ax.set_title(f"Customer Outcomes — {t}")
+    plt.tight_layout(); plt.savefig(os.path.join(output_dir, "outcomes_comparison.png"), dpi=200); plt.close()

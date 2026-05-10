@@ -1,81 +1,119 @@
-# Central Configuration file for the Vehicle Service Center Simulation
+"""
+Central Configuration Module — Vehicle Service Center Simulation
+Optimized with rigorous statistical distributions, NHPP, and full Flowchart granularity.
+"""
 
-import numpy as np
+import math
+from typing import Tuple
 
-# --- General Simulation Settings ---
-SIMULATION_TIME = 600  # Total simulation time in minutes (e.g., 10 hours)
-RANDOM_SEED = 42       # For reproducibility
+# ─────────────────────────────────────────────
+#  General Simulation Settings
+# ─────────────────────────────────────────────
+SIMULATION_TIME   = 600   # minutes
+RANDOM_SEED       = 42
 
-# --- Facility Resources ---
-NUM_INSPECTION_BAYS = 2
-NUM_GENERAL_BAYS = 5
-NUM_EXPRESS_BAYS = 1
+# ─────────────────────────────────────────────
+#  Facility Resources
+# ─────────────────────────────────────────────
+NUM_SERVICE_ADVISORS  = 2
+NUM_INSPECTION_BAYS   = 2
+NUM_GENERAL_BAYS      = 5
+NUM_EXPRESS_BAYS      = 1
 
-# --- Arrival Rates (Customers per minute) ---
-# Example: 1 customer arrives every roughly 15 minutes
-INTERARRIVAL_TIME_MEAN = 15.0
+# ─────────────────────────────────────────────
+#  Arrival Rates (Vehicles / min) - From Architecture 03
+# ─────────────────────────────────────────────
+# Increased LAMBDA_BASE to 0.100 to produce realistic queue dynamics (Issue 6)
+LAMBDA_BASE = 0.100
+LAMBDA_MAX  = LAMBDA_BASE * 3.0 
 
-# --- Service Time Distributions (in minutes) ---
-INSPECTION_TIME_MEAN = 10.0
-INSPECTION_TIME_STD = 2.0
+# ─────────────────────────────────────────────
+#  Service Time Distributions (minutes)
+#  Using Lognormal for realistic right-skewed non-negative times.
+# ─────────────────────────────────────────────
+def _lognorm_params(mean: float, std: float) -> Tuple[float, float]:
+    """Converts arithmetic mean & std to lognormal mu & sigma parameters."""
+    sigma2 = math.log(1 + (std**2 / mean**2))
+    mu = math.log(mean) - (sigma2 / 2)
+    return mu, math.sqrt(sigma2)
 
-# General Service times are longer for heavy-duty
-SERVICE_TIME_MEAN = 60.0    
-SERVICE_TIME_STD = 15.0     
+MU_ADV, SIG_ADV   = _lognorm_params(5.0, 1.5)
+MU_INSP, SIG_INSP = _lognorm_params(10.0, 2.0)
 
-# Express service for minor repairs
-EXPRESS_SERVICE_TIME_MEAN = 20.0
-EXPRESS_SERVICE_TIME_STD = 5.0
+# The total mu=166.7 from the architecture is broken down into granular stages
+MU_GEN, SIG_GEN   = _lognorm_params(120.0, 20.0)
+MU_EXP, SIG_EXP   = _lognorm_params(30.0, 5.0)
 
-# --- Psychological Parameters ---
-# Defines the base patience before reneging (in minutes) based on personality
-BASE_PATIENCE_LIMITS = {
-    'Conservative': (60, 120),
-    'Steady': (45, 90),
-    'Aggressive': (15, 45)
+# Granular Flowchart Stages (Deterministic or tightly bound normals)
+TIME_DRIVE_TO_BAY      = 1.0
+TIME_CLARIFY_SCOPE     = 3.0
+TIME_ORDER_REPAIR      = 2.0
+TIME_GET_SPARE_PARTS   = 10.0
+TIME_CHECK_COMPLETED   = 5.0
+TIME_DOCUMENTATION_PAY = 5.0
+
+PROB_ABLE_TO_REPAIR    = 0.95  # 5% chance the center cannot do the work (no parts/tools)
+EXPRESS_PROBABILITY    = 0.20
+
+# ─────────────────────────────────────────────
+#  Financial & Business Metrics ($)
+# ─────────────────────────────────────────────
+COST_PER_ADVISOR_HR = 25.0
+COST_PER_INSPECTOR_HR = 30.0
+COST_PER_MECHANIC_HR = 40.0
+
+REVENUE_GENERAL_BASE = 50.0
+REVENUE_GENERAL_PER_HR = 80.0
+REVENUE_EXPRESS = 120.0
+LOST_REVENUE_PENALTY = 100.0  # Avg lost revenue per balk/renege
+
+# ─────────────────────────────────────────────
+#  Hybrid / ABM Agent Parameters
+#  Implementation of the Liu-Zhen Emotional Contagion/Decay Model
+# ─────────────────────────────────────────────
+PATIENCE_PARAMS = {
+    "Conservative": _lognorm_params(90.0, 15.0),
+    "Steady":       _lognorm_params(67.5, 11.25),
+    "Aggressive":   _lognorm_params(30.0, 7.5),
 }
 
-# Modifiers to patience base limit based on emotion
-EMOTION_MULTIPLIERS = {
-    'Positive': 1.2,    # Increases patience
-    'Neutral': 1.0,     # No change
-    'Negative': 0.6,    # Decreases patience
-    'Unstable': 0.8     # Decreases patience sporadically
+BALK_THRESHOLDS = {
+    "Conservative": 10,
+    "Steady":        6,
+    "Aggressive":    3,
 }
 
-# Probabilities of customer distributions
-PERSONALITY_PROBS = [0.2, 0.5, 0.3]  # Conservative, Steady, Aggressive
-EMOTION_PROBS = [0.4, 0.4, 0.15, 0.05]   # Positive, Neutral, Negative, Unstable
+PERSONALITY_PROBS = [0.20, 0.50, 0.30]
+# Initial emotion values [0.0 = terrible, 1.0 = fantastic]
+EMOTION_INITIAL_MU = 0.8
+EMOTION_INITIAL_SIGMA = 0.1
 
-def get_random_interarrival(current_time):
-    """
-    Calculates exponential inter-arrival time based on time of day.
-    Rush hours have significantly shorter interarrival times (more traffic).
-    Returns the time until the next arrival.
-    """
-    # Assuming the simulation starts at a theoretical 08:00 AM (0 minutes)
-    # 0 - 120 mins (8am - 10am): Morning Rush Hour
-    # 300 - 420 mins (1pm - 3pm): Afternoon Rush Hour
-    
-    current_time_mod = current_time % 1440  # Support multi-day by modulo
-    
-    if (0 <= current_time_mod <= 120) or (300 <= current_time_mod <= 420):
-        # Rush Hour: High traffic
-        rate = INTERARRIVAL_TIME_MEAN * 0.4
-    else:
-        # Normal operations
-        rate = INTERARRIVAL_TIME_MEAN
-        
-    return np.random.exponential(rate)
+# ─────────────────────────────────────────────
+#  Optimization Sweep Ranges
+# ─────────────────────────────────────────────
+OPT_ADVISORS_RANGE    = [1, 2, 3]
+OPT_INSPECTION_RANGE  = [1, 2, 3]
+OPT_GENERAL_RANGE     = [4, 5, 6, 7]
+OPT_EXPRESS_RANGE     = [1, 2]
 
-def get_service_time(is_express=False):
-    """Gaussian service time."""
-    if is_express:
-        time = np.random.normal(EXPRESS_SERVICE_TIME_MEAN, EXPRESS_SERVICE_TIME_STD)
-    else:
-        time = np.random.normal(SERVICE_TIME_MEAN, SERVICE_TIME_STD)
-    return max(1.0, time) # Ensure positive service time
+# ─────────────────────────────────────────────
+#  Stochastic Sampling Helpers (Using explicit RNG stream)
+# ─────────────────────────────────────────────
+def get_arrival_rate(t: float) -> float:
+    """Returns exact arrival rate lambda(t) for NHPP."""
+    t_mod = t % 1440
+    if (0 <= t_mod <= 120) or (300 <= t_mod <= 420):
+        return LAMBDA_BASE * 3.0
+    elif (120 < t_mod <= 180) or (240 <= t_mod < 300):
+        return LAMBDA_BASE * 1.5
+    return LAMBDA_BASE
 
-def get_inspection_time():
-    time = np.random.normal(INSPECTION_TIME_MEAN, INSPECTION_TIME_STD)
-    return max(1.0, time)
+def get_advisor_time(rng) -> float: return rng.lognormal(MU_ADV, SIG_ADV)
+def get_inspection_time(rng) -> float: return rng.lognormal(MU_INSP, SIG_INSP)
+def get_service_time(rng, is_express: bool = False) -> float:
+    if is_express: return rng.lognormal(MU_EXP, SIG_EXP)
+    return rng.lognormal(MU_GEN, SIG_GEN)
+
+def get_stage_time(rng, base_time: float) -> float:
+    """Adds a small stochastic variance (10%) to deterministic stages."""
+    return max(0.1, rng.normal(base_time, base_time * 0.1))

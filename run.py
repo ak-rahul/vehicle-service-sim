@@ -1,20 +1,20 @@
 import argparse
 import logging
-import simpy
-from src.environment import ServiceCenter
-from src.simulation import simulation_manager, SIM_LOGS
-from src import config
-from src import analysis
+import json
 
-# Configure root logger
+from src import config
+from src.des_model import run_des
+from src.hybrid_model import run_hybrid
+from src.analysis import extract_kpis, export_static_charts
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SimulationRunner")
 
 def print_banner():
     banner = """
     ========================================================
-     🚗 VEHICLE SERVICE CENTER HYBRID SIMULATION
-        (Agent-Based & Discrete Event Simulation)
+     [VEHICLE] SERVICE CENTER SIMULATION
+        (Pure DES vs. Hybrid ABM)
     ========================================================
     """
     print(banner)
@@ -22,45 +22,65 @@ def print_banner():
 def main():
     parser = argparse.ArgumentParser(description="Run the Vehicle Service Center Simulation.")
     parser.add_argument('--time', type=int, default=config.SIMULATION_TIME, 
-                        help='Total simulation time in minutes (default from config)')
+                        help='Total simulation time in minutes')
+    parser.add_argument('--advisors', type=int, default=config.NUM_SERVICE_ADVISORS, 
+                        help='Number of service advisors')
     parser.add_argument('--bays', type=int, default=config.NUM_GENERAL_BAYS, 
                         help='Number of general service bays available')
     parser.add_argument('--express', type=int, default=config.NUM_EXPRESS_BAYS, 
                         help='Number of express service bays available')
+    parser.add_argument('--inspection', type=int, default=config.NUM_INSPECTION_BAYS, 
+                        help='Number of inspection bays')
+    parser.add_argument('--mode', choices=['des', 'hybrid', 'both'], default='both',
+                        help='Which model to run')
     parser.add_argument('--verbose', action='store_true', help='Enable detailed debug logging')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Override config logic via CLI arguments
-    if args.time: config.SIMULATION_TIME = args.time
-    if args.bays: config.NUM_GENERAL_BAYS = args.bays
-    if args.express: config.NUM_EXPRESS_BAYS = args.express
+        
+    cfg_override = {
+        "num_advisors": args.advisors,
+        "num_inspection": args.inspection,
+        "num_general": args.bays,
+        "num_express": args.express
+    }
 
     print_banner()
     logger.info(f"Initializing Environment parameters:")
-    logger.info(f"- Simulation Time:     {config.SIMULATION_TIME} minutes")
-    logger.info(f"- General Bays:        {config.NUM_GENERAL_BAYS}")
-    logger.info(f"- Express Bays:        {config.NUM_EXPRESS_BAYS}")
-    logger.info(f"- Inspection Bays:     {config.NUM_INSPECTION_BAYS}")
+    logger.info(f"- Simulation Time:     {args.time} minutes")
+    logger.info(f"- Advisors:            {args.advisors}")
+    logger.info(f"- Inspection Bays:     {args.inspection}")
+    logger.info(f"- General Bays:        {args.bays}")
+    logger.info(f"- Express Bays:        {args.express}")
     
-    logger.info("Starting simulation engine. Generating behavioral agents and processing DES Queues...")
+    des_logs = []
+    hybrid_logs = []
+    des_kpis = {}
+    hybrid_kpis = {}
     
-    env = simpy.Environment()
-    sc = ServiceCenter(env)
+    seed = config.RANDOM_SEED
     
-    # Start the core background process
-    env.process(simulation_manager(env, sc))
-    
-    # Run simulation
-    env.run(until=config.SIMULATION_TIME)
-    
-    print("⏳ Simulation sequence completed!")
-    
-    # Output to the root outputs folder
-    analysis.process_logs(SIM_LOGS, output_dir="outputs")
+    if args.mode in ['des', 'both']:
+        logger.info("Starting Pure DES simulation...")
+        des_logs = run_des(sim_time=args.time, cfg=cfg_override, seed=seed)
+        des_kpis = extract_kpis(des_logs, "DES", cfg=cfg_override, sim_time=args.time)
+        print("\n--- DES KPIs ---")
+        print(json.dumps(des_kpis, indent=2))
+        
+    if args.mode in ['hybrid', 'both']:
+        logger.info("Starting Hybrid simulation...")
+        hybrid_logs = run_hybrid(sim_time=args.time, cfg=cfg_override, seed=seed)
+        hybrid_kpis = extract_kpis(hybrid_logs, "Hybrid", cfg=cfg_override, sim_time=args.time)
+        print("\n--- Hybrid KPIs ---")
+        print(json.dumps(hybrid_kpis, indent=2))
+        
+    if args.mode == 'both':
+        logger.info("Generating comparison charts in outputs/ folder...")
+        export_static_charts(des_kpis, hybrid_kpis, des_logs, hybrid_logs, "outputs")
+        
+    print("\n[Done] Simulation sequence completed!")
 
 if __name__ == "__main__":
     main()
